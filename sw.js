@@ -1,5 +1,5 @@
 // 离线缓存：改过 index.html/manifest 后，把 CACHE 版本号 +1（如 v2）
-const CACHE = "mylife-v1";
+const CACHE = "mylife-v2";
 const ASSETS = [
   "./",
   "./index.html",

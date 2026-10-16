@@ -162,10 +162,36 @@
   .set-input{ width:100%; border:1px solid var(--line); background:var(--page); color:var(--ink);
     border-radius:10px; padding:9px 10px; font-size:13px; font-family:ui-monospace,Menlo,monospace; }
   .set-input::placeholder{ color:var(--muted); }
+  select.set-input{ font-family:inherit; -webkit-appearance:none; appearance:none; }
+
+  /* 顶部常驻计时条 */
+  .running-banner{ display:flex; align-items:center; gap:10px; background:var(--accent); color:var(--accent-ink);
+    border-radius:14px; padding:11px 14px; margin-bottom:14px; box-shadow:var(--shadow); }
+  .running-banner .rb-dot{ width:9px; height:9px; border-radius:50%; background:rgba(255,255,255,.92); flex:none; animation:rbPulse 1.3s ease-in-out infinite; }
+  @keyframes rbPulse{ 0%,100%{opacity:1} 50%{opacity:.35} }
+  .running-banner .rb-text{ flex:1; min-width:0; font-size:14px; font-weight:600; display:flex; align-items:baseline; gap:8px; }
+  .running-banner .rb-name{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .running-banner .rb-time{ font-variant-numeric:tabular-nums; font-weight:800; font-size:15px; flex:none; }
+  .running-banner .rb-stop{ border:1px solid rgba(255,255,255,.5); background:rgba(255,255,255,.12); color:var(--accent-ink);
+    border-radius:9px; padding:6px 12px; font-size:13px; font-weight:600; cursor:pointer; flex:none; }
+  .running-banner .rb-stop:active{ background:rgba(255,255,255,.28); }
+
+  /* 遗弃计时结算弹窗 */
+  .settle-actions{ display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  .settle-actions button{ flex:1 1 46%; padding:10px 8px; border-radius:10px; font-size:13.5px; font-weight:600; cursor:pointer; }
+  .settle-actions .s-primary{ border:none; background:var(--accent); color:var(--accent-ink); }
+  .settle-actions .s-ghost{ border:1px solid var(--line); background:var(--card); color:var(--ink); }
+  .settle-actions .s-danger{ border:1px solid var(--line); background:var(--card); color:#e34948; }
 </style>
 </head>
 <body>
 <div class="app">
+  <div class="running-banner" id="runningBanner" style="display:none;">
+    <span class="rb-dot"></span>
+    <span class="rb-text"><span class="rb-name" id="runningBannerName">—</span><span class="rb-time" id="runningBannerTime">0:00</span></span>
+    <button class="rb-stop" data-action="banner-stop">⏸ 暂停</button>
+  </div>
+
   <header class="top">
     <div>
       <div class="date-big" id="dateBig">—</div>
@@ -263,6 +289,19 @@
   </div>
 </div>
 
+<div class="modal" id="settleModal">
+  <div class="box">
+    <h3>⏱ 有个计时好像忘了关</h3>
+    <p id="settleText"></p>
+    <div class="settle-actions">
+      <button class="s-primary" data-settle="toStart">结算到开始那天</button>
+      <button class="s-ghost" data-settle="toToday">记到今天</button>
+      <button class="s-danger" data-settle="discard">丢弃这次计时</button>
+      <button class="s-ghost" data-settle="keep">继续计时</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (function(){
   "use strict";
@@ -313,6 +352,18 @@
   var activeView = "todo";
   var renderedToday = "";
   var modalMode = "restore";
+  var pendingSettle = false;
+
+  // 偏好设置：单次计时上限（小时），0 = 不自动暂停
+  var prefs = loadPrefs();
+  function loadPrefs(){
+    try {
+      var s = localStorage.getItem("mylife-prefs");
+      var p = s ? JSON.parse(s) : {};
+      return { capHours: (typeof p.capHours === "number") ? p.capHours : 3 };
+    } catch(e){ return { capHours:3 }; }
+  }
+  function savePrefs(){ try { localStorage.setItem("mylife-prefs", JSON.stringify(prefs)); } catch(e){} }
 
   function isDark(){
     var t = document.documentElement.getAttribute("data-theme");
@@ -420,6 +471,65 @@
     save(); renderAll();
   }
 
+  /* ---------- 忘记关计时的兜底 ---------- */
+  function runningName(id){
+    if(isExtraId(id)){
+      var ex = data.running && getExtras(data.running.date)[id];
+      return ex ? ex.name : "自定义事项";
+    }
+    for(var i=0;i<FIXED.length;i++){ if(FIXED[i].id === id) return FIXED[i].name; }
+    return "计时";
+  }
+  function renderBanner(){
+    var b = document.getElementById("runningBanner");
+    if(!data.running){ b.style.display = "none"; return; }
+    b.style.display = "flex";
+    document.getElementById("runningBannerName").textContent = runningName(data.running.id);
+    updateBannerTime();
+  }
+  function updateBannerTime(){
+    if(!data.running) return;
+    var el = document.getElementById("runningBannerTime");
+    if(el) el.textContent = fmtClock((Date.now() - data.running.startTs) / 1000);
+  }
+
+  function maybePromptAbandoned(){
+    if(!data.running || pendingSettle) return;
+    if(data.running.snoozed) return;
+    var elapsed = (Date.now() - data.running.startTs) / 1000;
+    var crossDay = data.running.date !== todayKey();
+    var capSec = prefs.capHours * 3600;
+    var overCap = capSec > 0 && elapsed >= capSec;
+    if(!crossDay && !overCap) return;
+
+    var d = parseKey(data.running.date);
+    var when = (d.getMonth()+1) + "月" + d.getDate() + "日 " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+    document.getElementById("settleText").textContent =
+      "「" + runningName(data.running.id) + "」从 " + when + " 开始计时，已经跑了 " + fmtDur(elapsed) +
+      "，看起来忘了暂停。要把它记到哪里？";
+    pendingSettle = true;
+    document.getElementById("settleModal").classList.add("show");
+  }
+  function settle(action){
+    pendingSettle = false;
+    document.getElementById("settleModal").classList.remove("show");
+    if(!data.running) return;
+    if(action === "toStart"){
+      commitRunning();
+    } else if(action === "toToday"){
+      data.running.date = todayKey();
+      commitRunning();
+    } else if(action === "discard"){
+      data.running = null;
+    } else if(action === "keep"){
+      // 把已跑的时长先结算到开始那天，然后从此刻重新计（相当于"确认继续"）
+      var id = data.running.id;
+      commitRunning();
+      data.running = { id:id, startTs:Date.now(), date:todayKey(), snoozed:true };
+    }
+    save(); renderAll();
+  }
+
   /* ---------- 渲染：待办 ---------- */
   function renderTodo(){
     var k = todayKey();
@@ -507,15 +617,11 @@
     function onVis(){ if(document.hidden || document.visibilityState === "hidden") opened = true; }
     document.addEventListener("visibilitychange", onVis);
     document.addEventListener("pagehide", onVis);
-    var iframe = document.createElement("iframe");
-    iframe.setAttribute("aria-hidden", "true");
-    iframe.style.cssText = "position:absolute;width:0;height:0;border:0;visibility:hidden;";
-    iframe.src = scheme;
-    document.body.appendChild(iframe);
+    // 直接跳转 scheme：iOS 上比隐藏 iframe 更可靠（Safari 常拦 iframe 唤起）
+    window.location.href = scheme;
     setTimeout(function(){
       document.removeEventListener("visibilitychange", onVis);
       document.removeEventListener("pagehide", onVis);
-      try { document.body.removeChild(iframe); } catch(e){}
       if(!opened && fallback){ window.location.href = fallback; }
     }, 1500);
   }
@@ -610,6 +716,7 @@
 
   function renderAll(){
     renderHeader();
+    renderBanner();
     renderTodo();
     if(activeView === "stats") renderStats();
   }
@@ -628,6 +735,7 @@
     var id = data.running.id;
     var el = document.querySelector('[data-time="' + id + '"]');
     if(el) el.textContent = fmtClock(liveSeconds(data.running.date, id, isExtraId(id) ? (getExtras(data.running.date)[id]) : null));
+    updateBannerTime();
     if(activeView === "stats" && statsKey === data.running.date) renderStats();
   }
 
@@ -646,6 +754,7 @@
     if(btn){
       var a = btn.getAttribute("data-action"), id = btn.getAttribute("data-id");
       if(a === "start") startTimer(id);
+      else if(a === "banner-stop"){ commitRunning(); save(); renderAll(); }
       else if(a === "reset") resetItem(id);
       else if(a === "del") deleteExtra(id);
       else if(a === "theme") toggleTheme();
@@ -729,9 +838,19 @@
   /* 定时刷新 */
   setInterval(function(){
     var nowToday = todayKey();
-    // 跨天自动结算
-    if(data.running && data.running.date !== nowToday){ commitRunning(); save(); renderAll(); return; }
-    if(data.running) updateRunningTime();
+    if(data.running && !pendingSettle){
+      // 跨天自动结算
+      if(data.running.date !== nowToday){ commitRunning(); save(); renderAll(); return; }
+      // 达到单次上限自动暂停
+      var capSec = prefs.capHours * 3600;
+      if(capSec > 0 && (Date.now() - data.running.startTs)/1000 >= capSec){
+        var nm = runningName(data.running.id);
+        commitRunning(); save(); renderAll();
+        flash("⏱ " + nm + " 已自动暂停（达到 " + prefs.capHours + " 小时上限）");
+        return;
+      }
+      updateRunningTime();
+    }
     if(nowToday !== renderedToday) renderAll();
   }, 1000);
 
@@ -743,6 +862,15 @@
       { key:"qihang", name:"启航教育" }
     ];
     var html = "";
+    var capOpts = [ [0,"不自动暂停"], [1,"1 小时"], [2,"2 小时"], [3,"3 小时（推荐）"], [4,"4 小时"], [6,"6 小时"] ];
+    html += '<div class="set-group">' +
+      '<div class="set-title">⏱ 忘记关计时？</div>' +
+      '<label class="set-label">单次计时上限（到点自动暂停）</label>' +
+      '<select class="set-input" data-pref="capHours">' +
+        capOpts.map(function(o){ return '<option value="' + o[0] + '"' + (prefs.capHours === o[0] ? " selected" : "") + '>' + o[1] + '</option>'; }).join("") +
+      '</select>' +
+      '<p class="hint">打开 App 时若发现忘关的计时，会自动弹窗问你怎么处理。</p>' +
+    '</div>';
     rows.forEach(function(r){
       var c = linkConfig[r.key] || {};
       html += '<div class="set-group">' +
@@ -756,17 +884,29 @@
     document.getElementById("settingsForm").innerHTML = html;
   }
   function saveSettings(){
-    document.querySelectorAll("#settingsForm .set-input").forEach(function(inp){
+    document.querySelectorAll("#settingsForm .set-input[data-key]").forEach(function(inp){
       var k = inp.getAttribute("data-key"), f = inp.getAttribute("data-field");
       if(linkConfig[k]) linkConfig[k][f] = inp.value.trim();
     });
+    var capEl = document.querySelector('#settingsForm [data-pref="capHours"]');
+    if(capEl){ prefs.capHours = parseInt(capEl.value, 10) || 0; savePrefs(); }
     saveLinks();
     document.getElementById("settingsModal").classList.remove("show");
     renderTodo();
-    flash("✅ 跳转设置已保存");
+    flash("✅ 设置已保存");
   }
   document.getElementById("settingsCancel").addEventListener("click", function(){ document.getElementById("settingsModal").classList.remove("show"); });
   document.getElementById("settingsSave").addEventListener("click", saveSettings);
+
+  /* 遗弃计时弹窗按钮 */
+  document.querySelectorAll("#settleModal [data-settle]").forEach(function(btn){
+    btn.addEventListener("click", function(){ settle(btn.getAttribute("data-settle")); });
+  });
+
+  /* 回到前台时检查是否有忘关的计时 */
+  document.addEventListener("visibilitychange", function(){
+    if(document.visibilityState === "visible") maybePromptAbandoned();
+  });
 
   /* 初始化 */
   (function init(){
@@ -774,6 +914,7 @@
     try { th = localStorage.getItem("mylife-theme"); } catch(e){}
     if(th){ document.documentElement.setAttribute("data-theme", th); document.getElementById("themeBtn").textContent = th === "dark" ? "☀️" : "🌙"; }
     renderAll();
+    maybePromptAbandoned();
   })();
 })();
 </script>
